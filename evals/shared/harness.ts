@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -99,6 +99,11 @@ type SuiteSummary = {
   results: EvalCaseResult[];
 };
 
+type CleanupStep = {
+  run: () => Promise<void>;
+  runSync?: () => void;
+};
+
 function localBin(name: string) {
   const suffix = process.platform === "win32" ? ".cmd" : "";
   return join(projectRoot, "node_modules", ".bin", `${name}${suffix}`);
@@ -154,6 +159,176 @@ async function writeText(path: string, value: string) {
 async function resetDir(path: string) {
   await rm(path, { force: true, recursive: true });
   await mkdir(path, { recursive: true });
+}
+
+function createCleanupScope() {
+  const steps: CleanupStep[] = [];
+  let running: Promise<void> | undefined;
+
+  return {
+    add(step: CleanupStep) {
+      steps.push(step);
+    },
+    run() {
+      if (!running) {
+        running = (async () => {
+          for (const step of steps) {
+            try {
+              await step.run();
+            } catch {
+              // Best effort cleanup.
+            }
+          }
+        })();
+      }
+
+      return running;
+    },
+    runSync() {
+      for (const step of steps) {
+        try {
+          step.runSync?.();
+        } catch {
+          // Best effort cleanup.
+        }
+      }
+    },
+  };
+}
+
+function installTerminationHandlers(cleanup: { runSync(): void }) {
+  let exiting = false;
+
+  const runAndExit = (exitCode: number, error?: unknown) => {
+    if (exiting) {
+      return;
+    }
+
+    exiting = true;
+
+    if (error) {
+      const message =
+        error instanceof Error ? (error.stack ?? error.message) : String(error);
+      process.stderr.write(`${message}\n`);
+    }
+
+    cleanup.runSync();
+    process.exit(exitCode);
+  };
+
+  const onSigint = () => {
+    void runAndExit(130);
+  };
+  const onSigterm = () => {
+    void runAndExit(143);
+  };
+  const onUncaughtException = (error: unknown) => {
+    runAndExit(1, error);
+  };
+  const onUnhandledRejection = (reason: unknown) => {
+    runAndExit(1, reason);
+  };
+  const onExit = () => {
+    cleanup.runSync();
+  };
+
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+  process.once("uncaughtException", onUncaughtException);
+  process.once("unhandledRejection", onUnhandledRejection);
+  process.once("exit", onExit);
+
+  return () => {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+    process.off("uncaughtException", onUncaughtException);
+    process.off("unhandledRejection", onUnhandledRejection);
+    process.off("exit", onExit);
+  };
+}
+
+function startShutdownWatchdog(opencodePid: number, executorHome: string) {
+  const watchdogCode = `
+    const { spawnSync } = require("node:child_process");
+    const parentPid = Number(process.argv[1]);
+    const serverPid = Number(process.argv[2]);
+    const executorBin = process.argv[3];
+    const executorHome = process.argv[4];
+    const isWindows = process.argv[5] === "win32";
+
+    function parentIsAlive() {
+      try {
+        process.kill(parentPid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function cleanup() {
+      if (serverPid > 0) {
+        try {
+          if (isWindows) {
+            process.kill(serverPid, "SIGKILL");
+          } else {
+            process.kill(-serverPid, "SIGKILL");
+          }
+        } catch {}
+      }
+
+      try {
+        spawnSync(executorBin, ["down"], {
+          env: {
+            ...process.env,
+            EXECUTOR_HOME: executorHome,
+          },
+          stdio: "ignore",
+        });
+      } catch {}
+    }
+
+    const interval = setInterval(() => {
+      if (parentIsAlive()) {
+        return;
+      }
+
+      clearInterval(interval);
+      cleanup();
+      process.exit(0);
+    }, 250);
+
+    interval.unref();
+  `;
+
+  const child = spawn(
+    process.execPath,
+    [
+      "-e",
+      watchdogCode,
+      String(process.pid),
+      String(opencodePid),
+      localBin("executor"),
+      executorHome,
+      process.platform,
+    ],
+    {
+      cwd: projectRoot,
+      detached: true,
+      stdio: "ignore",
+    },
+  );
+
+  child.unref();
+
+  return {
+    stop() {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Best effort shutdown.
+      }
+    },
+  };
 }
 
 async function runCommand(
@@ -390,6 +565,7 @@ async function startOpencodeServer(config: Config, opencodeHome: string) {
   });
 
   return {
+    pid: child.pid ?? 0,
     url,
     async close() {
       if (process.platform !== "win32") {
@@ -422,6 +598,25 @@ async function startOpencodeServer(config: Config, opencodeHome: string) {
         });
       });
     },
+    forceCloseSync() {
+      if (!child.pid) {
+        return;
+      }
+
+      if (process.platform !== "win32") {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          // Best effort shutdown.
+        }
+      } else {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Best effort shutdown.
+        }
+      }
+    },
   };
 }
 
@@ -429,6 +624,17 @@ async function stopExecutor(executorHome: string) {
   await runCommand(localBin("executor"), ["down"], {
     ...process.env,
     EXECUTOR_HOME: executorHome,
+  });
+}
+
+function stopExecutorSync(executorHome: string) {
+  spawnSync(localBin("executor"), ["down"], {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      EXECUTOR_HOME: executorHome,
+    },
+    stdio: "ignore",
   });
 }
 
@@ -837,13 +1043,20 @@ async function runEvalCase(evalCase: EvalCase, suiteRoot: string) {
   await resetDir(opencodeHome);
 
   const pingServer = await startPingServer(pingPort);
+  const cleanupScope = createCleanupScope();
+  const uninstallTerminationHandlers = installTerminationHandlers(cleanupScope);
   const opencodeConfig: Config = {
     $schema: "https://opencode.ai/config.json",
     logLevel: "ERROR",
     model,
   };
 
-  let opencodeServer: { url: string; close(): Promise<void> } | undefined;
+  let opencodeServer:
+    | { pid: number; url: string; close(): Promise<void>; forceCloseSync(): void }
+    | undefined;
+  let shutdownWatchdog:
+    | { stop(): void }
+    | undefined;
   let monitor:
     | ReturnType<typeof createSessionMonitor>
     | undefined;
@@ -856,11 +1069,56 @@ async function runEvalCase(evalCase: EvalCase, suiteRoot: string) {
   let messages: SessionMessageRecord[] = [];
   let error: unknown;
 
+  cleanupScope.add({
+    async run() {
+      if (client && sessionID) {
+        await abortSession(client, sessionID);
+      }
+    },
+  });
+  cleanupScope.add({
+    async run() {
+      await monitor?.stop().catch(() => undefined);
+    },
+  });
+  cleanupScope.add({
+    async run() {
+      await pingServer.close();
+    },
+  });
+  cleanupScope.add({
+    async run() {
+      if (opencodeServer) {
+        await opencodeServer.close().catch(() => undefined);
+      }
+    },
+    runSync() {
+      opencodeServer?.forceCloseSync();
+    },
+  });
+  cleanupScope.add({
+    async run() {
+      shutdownWatchdog?.stop();
+    },
+    runSync() {
+      shutdownWatchdog?.stop();
+    },
+  });
+  cleanupScope.add({
+    async run() {
+      await stopExecutor(executorHome).catch(() => undefined);
+    },
+    runSync() {
+      stopExecutorSync(executorHome);
+    },
+  });
+
   try {
     preflight = await preflightExecutorTools(executorHome);
     await writeJson(join(artifactDir, "preflight.json"), preflight);
 
     opencodeServer = await startOpencodeServer(opencodeConfig, opencodeHome);
+    shutdownWatchdog = startShutdownWatchdog(opencodeServer.pid, executorHome);
     client = createOpencodeClient({ baseUrl: opencodeServer.url });
 
     expectOk(
@@ -958,19 +1216,8 @@ async function runEvalCase(evalCase: EvalCase, suiteRoot: string) {
       await abortSession(client, sessionID);
     }
   } finally {
-    await monitor?.stop().catch(() => undefined);
-
-    try {
-      await pingServer.close();
-    } catch {
-      // Best effort cleanup.
-    }
-
-    if (opencodeServer) {
-      await opencodeServer.close().catch(() => undefined);
-    }
-
-    await stopExecutor(executorHome).catch(() => undefined);
+    uninstallTerminationHandlers();
+    await cleanupScope.run();
   }
 
   const pingState = pingServer.getState();
