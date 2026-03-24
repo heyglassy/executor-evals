@@ -10,6 +10,17 @@ import type { Event, Part } from "@opencode-ai/sdk";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const projectRoot = join(__dirname, "..", "..");
+const dotEnvPath = join(projectRoot, ".env");
+
+try {
+  process.loadEnvFile(dotEnvPath);
+} catch (error) {
+  const envError = error as NodeJS.ErrnoException;
+
+  if (envError.code !== "ENOENT") {
+    throw error;
+  }
+}
 
 const pingPort = Number(process.env.EVAL_PORT ?? "43123");
 const providerID = "opencode";

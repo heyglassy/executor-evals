@@ -24,6 +24,12 @@ TypeScript eval harnesses for testing an OpenCode session against the local `exe
 pnpm install
 ```
 
+Create a local `.env` file for secrets:
+
+```bash
+OPENCODE_ZEN_API_KEY=your-key-here
+```
+
 ## Run
 
 List available eval cases:
