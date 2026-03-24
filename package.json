@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "eval": "tsx \"list sources.ts\"",
+    "eval:list": "tsx \"list sources.ts\" --list",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
