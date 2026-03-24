@@ -1,0 +1,23 @@
+{
+  "runtime": "quickjs",
+  "sources": {
+    "eval": {
+      "kind": "mcp",
+      "name": "Eval Test Source",
+      "namespace": "eval",
+      "enabled": true,
+      "connection": {
+        "endpoint": "stdio://local/eval-test-source"
+      },
+      "binding": {
+        "transport": "stdio",
+        "command": "pnpm",
+        "args": ["exec", "tsx", "test-mcp-server.ts"],
+        "env": {
+          "EVAL_PING_URL": "http://127.0.0.1:43123/ping"
+        },
+        "cwd": "."
+      }
+    }
+  }
+}
